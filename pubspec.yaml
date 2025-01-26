@@ -1,5 +1,5 @@
 name: doc_belichenko
-description: "A new Flutter project."
+description: "Test app to imitate a dock from Mac OS."
 publish_to: 'none'
 version: 0.1.0
 
@@ -7,7 +7,6 @@ environment:
   sdk: ^3.5.4
 
 dependencies:
-  animated_reorderable_list: ^1.1.5
   flutter:
     sdk: flutter
   get: ^4.6.6
