@@ -1,6 +1,8 @@
 import 'package:doc_belichenko/common/consts.dart';
 import 'package:doc_belichenko/common/enums.dart';
-import 'package:doc_belichenko/common/helpers.dart';
+import 'package:doc_belichenko/common/managers/animation_manager.dart';
+import 'package:doc_belichenko/common/managers/logger.dart';
+import 'package:doc_belichenko/common/utils/find_dragged_index.dart';
 import 'package:doc_belichenko/controllers/drag_inside_controller.dart';
 import 'package:doc_belichenko/controllers/drag_outside_controller.dart';
 import 'package:doc_belichenko/controllers/hover_controller.dart';
@@ -10,79 +12,77 @@ import 'package:doc_belichenko/models/element_model.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
-//Main Controller
-//It contains 4 controllers: [HoverController], [DragOutsideController], [DragInsideController], [InitActionsController]
-//First 3 controllers handling 3 types of actions in this test app
-//It is responsible for managing drag-and-drop operations and hover effects
-//and also used as provider for other controllers
-class Controller extends GetxController with GetTickerProviderStateMixin {
+///Main [GetxController] for managing state of the [Dock], [DockItem], [PositionedDragElement], [IconItem] widgets.
+///
+///All access to the ui happens through this controller.
+///Handle all 3 main drag actions:
+///Hover - [HoverController]
+///Drag outside / input element - [DragOutsideController]
+///Drag inside/ Swap elements - [DragInsideController]
+
+class Controller extends GetxController {
   final RxList<ElementModel> _items = defaultElements.obs;
+  final Rx<DragInfo?> _dragInfo = Rx<DragInfo?>(null);
+  final RxBool _isCanceled = false.obs;
+
+  final GlobalKey _containerKey = GlobalKey();
+
+  final HoverController _hoverController = HoverController();
+  final DragOutsideController _dragOutsideController = DragOutsideController();
+  final DragInsideController _dragInsideController = DragInsideController();
+  final InitActionsController _initActionsController = InitActionsController();
+  final AnimationManager _animationManager = AnimationManager.instance;
 
   List<ElementModel> get items => _items;
-
-  Rx<DragInfo?> _dragInfo = Rx<DragInfo?>(null);
-
   DragInfo? get dragInfo => _dragInfo.value;
+  bool get isCanceled => _isCanceled.value;
+  GlobalKey get containerKey => _containerKey;
+  HoverController get hoverController => _hoverController;
+  AnimationManager get animationManager => _animationManager;
 
-  final HoverController _hoveredController = HoverController();
-  final DragOutsideController _dragOutsideController = DragOutsideController();
-  final InitActionsController _initActionsController = InitActionsController();
-  final DragInsideController _dragInsideController = DragInsideController();
+  @override
+  void onInit() {
+    super.onInit();
+    _initActionsController.initializeItemsModels(items);
+  }
 
-  HoverController get hoveredController => _hoveredController;
-  DragOutsideController get dragOutsideController => _dragOutsideController;
-  DragInsideController get dragInsideController => _dragInsideController;
+  @override
+  void onReady() {
+    super.onReady();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initActionsController.calculateItemInitialOffsets(items);
+    });
+  }
+
+  @override
+  void onClose() {
+    _animationManager.dispose();
+    super.onClose();
+  }
 
   void onDragStarted(int index) {
-    _hoveredController.resetHoverEffects(items);
-    _dragInfo = DragInfo(
-      draggedIndex: index,
-      currentDragState: DragState.inside,
-      previousDragState: DragState.inside,
-    ).obs;
-    _items[index] = _items[index].copyWith(isDragged: true);
-    _items.refresh();
+    _resetHoverEffects();
+    _startNewDrag(index);
   }
 
   void onDragUpdate(Offset mousePosition) {
     try {
-      final newDragState =
-          DragInfo.calculateDragState(AppConsts.containerKey, mousePosition);
-      final previousDragState = _dragInfo.value?.currentDragState;
-      _dragInfo.value = _dragInfo.value?.copyWith(
-        currentDragState: newDragState,
-        previousDragState: previousDragState,
-      );
-      if (_dragInfo.value?.previousDragState == DragState.outside &&
-          _dragInfo.value?.currentDragState == DragState.inside) {
-        _dragInfo.value =
-            _dragInfo.value?.copyWith(isPlacedBetweenItemsActive: true);
-        _dragOutsideController.placeDraggableBetweenItems(
-            mousePosition, _items);
-        _items.refresh();
-      }
+      _updateDragInfo(mousePosition);
     } catch (e) {
-      AppConsts.logger.e(e);
+      LoggerBase.e(e);
     } finally {
-      _dragInfo.value =
-          _dragInfo.value?.copyWith(isPlacedBetweenItemsActive: false);
+      _resetPlacementState();
     }
   }
 
-  void onDragEnd() {
-    final dragIndex = DragInfo.findDraggedIndex(_items);
-    _items[dragIndex] = _items[dragIndex].copyWith(isDragged: false);
-    _dragInfo = null.obs;
-    if (_dragInsideController.functionQueue.isNotEmpty) {
-      for (var element in _items) {
-        element.animationController?.reset();
-        element = element.copyWith(
-            animationController: createNewAnimationController(this));
-      }
-      _items.refresh();
-      _dragInsideController.isProcessingQueue = false;
-      _dragInsideController.functionQueue.clear();
-    }
+  Future<void> onDragEnd() async {
+    _dragInsideController.clearQueueOutside();
+    _isCanceled.value = true;
+
+    await Future.delayed(AppConsts.animationDuration);
+
+    _finalizeDrag();
+    _isCanceled.value = false;
   }
 
   void onSwapLeave() {
@@ -97,33 +97,76 @@ class Controller extends GetxController with GetTickerProviderStateMixin {
     required Offset currentPosition,
     required int targetIndex,
   }) {
-    final isPlacedBetweenItemsActive =
-        _dragInfo.value?.isPlacedBetweenItemsActive;
+    if (dragInfo?.isPlacedBetweenItemsActive == true) return;
+
     _dragInsideController.onSwapUpdate(
-        currentPosition: currentPosition,
-        targetIndex: targetIndex,
-        ticker: this,
-        items: _items,
-        isPlacedBetweenItemsActive: isPlacedBetweenItemsActive ?? false);
+      currentPosition: currentPosition,
+      targetIndex: targetIndex,
+      items: _items,
+    );
+    _updateDraggedIndex();
   }
 
-  @override
-  void onInit() {
-    super.onInit();
-    _initActionsController.initializeItemsModels(items, this);
-    _hoveredController.onInit();
+  void _resetHoverEffects() {
+    _hoverController.resetHoverEffects(items);
   }
 
-  @override
-  void onReady() {
-    super.onReady();
-    _initActionsController.calculateItemInitialOffsets(items);
-    _initActionsController.calculateItemCenters(items);
+  void _startNewDrag(int index) {
+    _dragInfo.value = DragInfo.createNewDragInfo(index, _items[index]);
+    ElementModel.updateElementModelFromList(items, index, isDragged: true);
+    _items.refresh();
   }
 
-  @override
-  void onClose() {
-    super.onClose();
-    _hoveredController.dispose();
+  void _updateDragInfo(Offset mousePosition) {
+    final newDragState =
+        DragInfo.calculateDragState(_containerKey, mousePosition);
+    final previousDragState = _dragInfo.value?.currentDragState;
+
+    _dragInfo.value = _dragInfo.value?.copyWith(
+      endDragPosition: mousePosition,
+      currentDragState: newDragState,
+      previousDragState: previousDragState,
+    );
+
+    if (previousDragState == DragState.outside &&
+        newDragState == DragState.inside) {
+      _dragInfo.value =
+          _dragInfo.value?.copyWith(isPlacedBetweenItemsActive: true);
+      _dragOutsideController.placeDraggableBetweenItems(
+        mousePosition,
+        _items,
+        _containerKey,
+      );
+      _items.refresh();
+    }
+  }
+
+  void _resetPlacementState() {
+    _dragInfo.value =
+        _dragInfo.value?.copyWith(isPlacedBetweenItemsActive: false);
+  }
+
+  void _finalizeDrag() {
+    final dragIndex = findDraggedIndex(items);
+    if (dragIndex == null) return;
+
+    _items[dragIndex] = _items[dragIndex].copyWith(isDragged: false);
+    for (int i = 0; i < items.length; i++) {
+      ElementModel.updateElementModelFromList(
+        items,
+        i,
+        animationController: null,
+      );
+    }
+
+    _dragInfo.value = null;
+  }
+
+  void _updateDraggedIndex() {
+    _dragInfo.value = _dragInfo.value?.copyWith(
+      draggedIndex: findDraggedIndex(items),
+    );
+    _dragInfo.refresh();
+    _items.refresh();
   }
 }

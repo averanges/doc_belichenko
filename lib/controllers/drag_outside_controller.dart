@@ -1,54 +1,29 @@
 import 'package:doc_belichenko/common/consts.dart';
 import 'package:doc_belichenko/common/enums.dart';
-import 'package:doc_belichenko/common/helpers.dart';
-import 'package:doc_belichenko/models/drag_info.dart';
+import 'package:doc_belichenko/common/managers/logger.dart';
+import 'package:doc_belichenko/common/utils/calculate_distance.dart';
+import 'package:doc_belichenko/common/utils/create_new_render_box_model_from_key.dart';
+import 'package:doc_belichenko/common/utils/find_dragged_index.dart';
 import 'package:doc_belichenko/models/element_model.dart';
+import 'package:doc_belichenko/models/item_render_box_model.dart';
 import 'package:flutter/material.dart';
 
-// Controller for managing drag-and-drop operations when items are dragged outside their original area.
-// This controller handles the logic for placing draggable items between existing items in a list.
+/// Controller for managing drag-and-drop operations when items are dragged outside their original area.
+///
+/// There are 2 main functions:
+/// [placeDraggableBetweenItems] - called when the user drags an element outside [Dock] based on it's [ItemRenderBoxModel].
+/// [onSwapLeave] - called when the user leaves the list or stops dragging an element inside the list.
 class DragOutsideController {
-  // Places the draggable item between existing items based on the pointer position.
-  // It calculates the closest items and determines where to insert the draggable item.
-  // Basically it places the [childWhenDragging] between the closest items
-  // but [feedback] remains the same
-  void placeDraggableBetweenItems(
-      Offset pointerPosition, List<ElementModel> items) {
+  ///When user drags element back inside [Dock] calculate new position [Draggable]
+  ///based on how close it is to every [ElementModel]. Swap position with closest to pointerPosition [ElementModel].
+  void placeDraggableBetweenItems(Offset pointerPosition,
+      List<ElementModel> items, GlobalKey containerKey) {
     int firstClosestIndex = -1;
     int secondClosestIndex = -1;
-    double minDistance = double.infinity;
-    double secondMinDistance = double.infinity;
-
-    final GlobalKey containerKey = AppConsts.containerKey;
 
     try {
-      final containerDetails = getRenderBoxDetails(containerKey);
-      final leftBoundary = containerDetails.boundaries[Direction.left];
-      final rightBoundary = containerDetails.boundaries[Direction.right];
-
-      final distanceToLeft = (pointerPosition.dx - leftBoundary).abs();
-      final distanceToRight = (pointerPosition.dx - rightBoundary).abs();
-
-      for (int i = 0; i < items.length; i++) {
-        try {
-          final itemDetails = getRenderBoxDetails(items[i].key);
-
-          final double distance =
-              (pointerPosition - itemDetails.center).distance;
-
-          if (distance < minDistance) {
-            secondMinDistance = minDistance;
-            secondClosestIndex = firstClosestIndex;
-            minDistance = distance;
-            firstClosestIndex = i;
-          } else if (distance < secondMinDistance) {
-            secondMinDistance = distance;
-            secondClosestIndex = i;
-          }
-        } catch (e) {
-          AppConsts.logger.e("Error fetching details for item at index $i: $e");
-        }
-      }
+      (firstClosestIndex, secondClosestIndex) =
+          _findClosestIndexes(pointerPosition: pointerPosition, items: items);
 
       if (firstClosestIndex == -1 || secondClosestIndex == -1) {
         return;
@@ -60,35 +35,98 @@ class DragOutsideController {
         secondClosestIndex = temp;
       }
 
-      int insertIndex;
-      if (distanceToLeft < distanceToRight && distanceToLeft < minDistance) {
-        insertIndex = 0;
-      } else if (distanceToRight < distanceToLeft &&
-          distanceToRight < minDistance) {
-        insertIndex = items.length;
-      } else {
-        insertIndex = firstClosestIndex + 1;
-      }
+      final containerDetails = createNewRenderBoxModelFromKey(containerKey);
 
-      final draggedIndex = DragInfo.findDraggedIndex(items);
-      if (draggedIndex != -1) {
-        moveAndShiftPositions(draggedIndex, insertIndex, items);
-      }
+      final (distanceToLeft, distanceToRight) =
+          _calculateDistanceForLeftAndRight(containerDetails, pointerPosition);
+
+      final insertIndex = _calculateInsertIndex(
+          distanceToLeft: distanceToLeft,
+          distanceToRight: distanceToRight,
+          firstClosestIndex: firstClosestIndex,
+          items: items);
+
+      final draggedIndex = findDraggedIndex(items);
+      if (draggedIndex == null) return;
+      _moveAndShiftPositions(draggedIndex, insertIndex, items);
     } catch (e) {
-      AppConsts.logger.e("Error during drag outside: $e");
+      LoggerBase.e("Error during drag outside: $e");
     }
   }
 
-  // Moves and shifts the positions of items in the list based on the source and target indices.
-  // This function updates the offsets of the items to maintain their positions correctly.
-  void moveAndShiftPositions(
+  (double distanceToLeft, double distanceToRight)
+      _calculateDistanceForLeftAndRight(
+          ItemRenderBoxModel item, Offset pointerPosition) {
+    final leftBoundary = item.boundaries[Direction.left];
+    final rightBoundary = item.boundaries[Direction.right];
+
+    final distanceToLeft = (pointerPosition.dx - leftBoundary).abs();
+    final distanceToRight = (pointerPosition.dx - rightBoundary).abs();
+
+    return (distanceToLeft, distanceToRight);
+  }
+
+  (int firstClosestIndex, int secondClosestIndex) _findClosestIndexes(
+      {required Offset pointerPosition, required List<ElementModel> items}) {
+    int firstClosestIndex = -1;
+    int secondClosestIndex = -1;
+    double minDistance = double.maxFinite;
+    double secondMinDistance = double.maxFinite;
+
+    for (int i = 0; i < items.length; i++) {
+      try {
+        final itemDetails = items[i].renderBoxModel;
+
+        if (itemDetails == null) {
+          LoggerBase.e('RenderBox for item $i is null');
+          continue;
+        }
+
+        final double distance =
+            calculateDistance(pointerPosition, itemDetails.center);
+
+        if (distance < minDistance) {
+          secondMinDistance = minDistance;
+          secondClosestIndex = firstClosestIndex;
+          minDistance = distance;
+          firstClosestIndex = i;
+        } else if (distance < secondMinDistance) {
+          secondMinDistance = distance;
+          secondClosestIndex = i;
+        }
+      } catch (e) {
+        LoggerBase.e("Error fetching details for item at index $i: $e");
+      }
+    }
+
+    return (firstClosestIndex, secondClosestIndex);
+  }
+
+  int _calculateInsertIndex(
+      {required double distanceToLeft,
+      required double distanceToRight,
+      required int firstClosestIndex,
+      required List<ElementModel> items}) {
+    int insertIndex;
+    if (distanceToLeft < AppConsts.minimumDistanceThreshold) {
+      insertIndex = 0;
+    } else if (distanceToRight < AppConsts.minimumDistanceThreshold) {
+      insertIndex = items.length;
+    } else {
+      insertIndex = firstClosestIndex + 1;
+    }
+    return insertIndex;
+  }
+
+  ///Switch not only position of [dragIndex] and [targetIndex] but all positions of other items.
+  void _moveAndShiftPositions(
       int sourceIndex, int targetIndex, List<ElementModel> items) {
     if (sourceIndex == targetIndex) return;
 
     try {
-      final initialOffsets = items.map((e) => e.endOffset).toList();
-      final centerOffsets = items.map((e) => e.centerOffset).toList();
-      final startOffsets = items.map((e) => e.initialOffset).toList();
+      final endOffsets = items.map((e) => e.renderBoxModel?.endOffset).toList();
+      final initialOffsets =
+          items.map((e) => e.renderBoxModel?.initialOffset).toList();
 
       final draggedItem = items[sourceIndex];
 
@@ -100,14 +138,14 @@ class DragOutsideController {
       items.insert(adjustedTargetIndex, draggedItem);
 
       for (int i = 0; i < items.length; i++) {
-        items[i] = items[i].copyWith(
-          endOffset: initialOffsets[i],
-          initialOffset: startOffsets[i],
-          centerOffset: centerOffsets[i],
-        );
+        ElementModel.updateElementModelFromList(items, i,
+            renderBoxModel: items[i].renderBoxModel?.updateOffset(
+                recalculateCenter: true,
+                newOffset: endOffsets[i],
+                initialOffset: initialOffsets[i]));
       }
     } catch (e) {
-      AppConsts.logger.e('Error: $e');
+      LoggerBase.e('Error: $e');
     }
   }
 }

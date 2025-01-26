@@ -24,12 +24,12 @@ class Dock<T> extends StatelessWidget {
     return MouseRegion(
       cursor: SystemMouseCursors.grab,
       onHover: (event) =>
-          _controller.hoveredController.onHover(event, _controller.items),
-      onExit: (event) => _controller.hoveredController.resetHoverEffects(
+          _controller.hoverController.onHover(event, _controller.items),
+      onExit: (event) => _controller.hoverController.resetHoverEffects(
         _controller.items,
       ),
       child: Container(
-        key: AppConsts.containerKey,
+        key: _controller.containerKey,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(AppConsts.itemBorderRadius),
           color: AppConsts.containerColor,

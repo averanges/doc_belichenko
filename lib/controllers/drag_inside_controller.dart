@@ -1,62 +1,41 @@
-import 'dart:collection';
-
+import 'package:doc_belichenko/common/consts.dart';
 import 'package:doc_belichenko/common/enums.dart';
-import 'package:doc_belichenko/common/helpers.dart';
-import 'package:doc_belichenko/models/drag_info.dart';
+import 'package:doc_belichenko/common/managers/animation_manager.dart';
+import 'package:doc_belichenko/common/managers/queue_mixin.dart';
+import 'package:doc_belichenko/common/utils/calculate_movements.dart';
+import 'package:doc_belichenko/common/utils/find_dragged_index.dart';
+import 'package:doc_belichenko/common/utils/find_touch_side.dart';
 import 'package:doc_belichenko/models/element_model.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
-// Controller for managing drag-and-drop operations within a list of elements.
-// This controller handles the logic for swapping items when dragged inside a target area.
-class DragInsideController extends GetxController {
+///Controller for managing drag-inside / swap operations within a list of elements.
+///
+///There 3 main functions:
+///[onSwapStarted] - called when the user starts dragging an element inside the list.
+///[onSwapUpdate] - called when the user drags an element inside the list.
+///[onSwapLeave] - called when the user leaves the list or stops dragging an element inside the list.
+class DragInsideController extends GetxController with QueueProcessorMixin {
   Offset? _initialTouchPosition;
   int? _currentTargetIndex;
   Direction? _touchSide;
 
-  final Queue<Future Function()> _functionQueue = Queue();
-  bool _isProcessingQueue = false;
-
-  Queue<Future Function()> get functionQueue => _functionQueue;
-  bool get isProcessingQueue => _isProcessingQueue;
-
-  set isProcessingQueue(bool value) {
-    _isProcessingQueue = value;
-    update();
-  }
-
-  // Resets the initial touch position, current target index, and touch side when a swap operation is canceled.
-  void onSwapLeave() {
-    _initialTouchPosition = null;
-    _currentTargetIndex = null;
-    _touchSide = null;
-  }
-
-  // Initializes the swap operation with the touch position and target index.
-  // Determines the side of the drag target that was touched based on the touch position.
+  ///Called when  [Draggable] touches [DragTarget] widget.
   void onSwapStarted(
       Offset touchPosition, int targetIndex, List<ElementModel> items) {
     _initialTouchPosition = touchPosition;
     _currentTargetIndex = targetIndex;
 
-    final targetCenter = items[targetIndex].centerOffset;
-    if ((touchPosition.dx - targetCenter.dx).abs() >
-        (touchPosition.dy - targetCenter.dy).abs()) {
-      _touchSide =
-          touchPosition.dx < targetCenter.dx ? Direction.left : Direction.right;
-    } else {
-      _touchSide =
-          touchPosition.dy < targetCenter.dy ? Direction.top : Direction.bottom;
-    }
+    _touchSide = findTouchSide(touchPosition, items[targetIndex]);
   }
 
-  // Updates the position of the draggable item based on the current touch position.
-  //Do not start immediate
-  // Only updates if the draggable has crossed a threshold to trigger a swap operation.
+  ///Called when the user move [Draggable] over [DragTarget] widget.
+  ///
+  ///[calculateMovements] determines which [Direction] current [Draggable] is moving.
+  ///and return current moved distance it triggers [updatePosition] if the distance is greater than [AppConsts.swapThreshold].
   void onSwapUpdate(
       {required Offset currentPosition,
       required int targetIndex,
-      required TickerProvider ticker,
       required List<ElementModel> items,
       bool isPlacedBetweenItemsActive = false}) {
     if (_initialTouchPosition == null || _currentTargetIndex != targetIndex) {
@@ -64,104 +43,130 @@ class DragInsideController extends GetxController {
     }
     if (isPlacedBetweenItemsActive) return;
 
-    final targetCenter = items[targetIndex].centerOffset;
-    double movementDistance = 0.0;
-    switch (_touchSide) {
-      case Direction.left:
-        movementDistance = targetCenter.dx - currentPosition.dx;
-        break;
-      case Direction.right:
-        movementDistance = currentPosition.dx - targetCenter.dx;
-        break;
-      case Direction.top:
-        return;
-      case Direction.bottom:
-        return;
-      default:
-        return;
-    }
+    final targetCenter = items[targetIndex].renderBoxModel?.center;
 
-    const double threshold = 50.0;
-    if (movementDistance > threshold) {
-      updatePosition(targetIndex, items, ticker);
+    if (targetCenter == null) return;
+
+    final movementDistance =
+        calculateMovements(_touchSide, currentPosition, targetCenter);
+
+    if (movementDistance == null) return;
+
+    if (movementDistance > AppConsts.swapThreshold) {
+      _updatePosition(targetIndex, items);
       _initialTouchPosition = null;
       _currentTargetIndex = null;
       _touchSide = null;
     }
   }
 
-  // Updates the position of the dragged item and manages animations.
-  // Adds the operation to the queue for processing.
-  //The main idea pf using queue to prevent all animations happens at the same time
-  void updatePosition(
-      int targetIndex, List<ElementModel> items, TickerProvider ticker) {
-    _functionQueue.add(() async {
-      final draggedIndex = DragInfo.findDraggedIndex(items);
-      if (draggedIndex == -1 || targetIndex == draggedIndex) return;
-
+  ///Triggers [AnimationController] and updates the positions of the dragged and target items in order of [QueueProcessorMixin].
+  void _updatePosition(int targetIndex, List<ElementModel> items) {
+    addFunctionToQueue(() async {
+      final draggedIndex = findDraggedIndex(items);
+      if (draggedIndex == null || targetIndex == draggedIndex) return;
       if ((targetIndex - draggedIndex).abs() != 1) return;
 
-      final draggedItem = items[draggedIndex];
       final targetItem = items[targetIndex];
 
-      // Update endOffsets for smooth animation
-      items[targetIndex] = targetItem.copyWith(
-        isAnimated: true,
-        endOffset: draggedItem.initialOffset,
-      );
-
-      items[draggedIndex] = draggedItem.copyWith(
-        isAnimated: false,
-        endOffset: targetItem.initialOffset,
-      );
-
-      items.reactive.refresh();
-      if (targetItem.animationController == null || !targetItem.isAnimated) {
-        debugPrint('animation not started');
-      }
+      _prepareItemsForAnimation(draggedIndex, targetIndex, items);
 
       await targetItem.animationController?.forward(from: 0);
 
-      // Swap internal properties of both elements after animation
-      items[draggedIndex] = draggedItem.copyWith(
-        initialOffset: targetItem.initialOffset,
-        centerOffset: targetItem.centerOffset,
-        endOffset: Offset.zero,
-      );
+      _updateInternalPropertiesAfterAnimation(draggedIndex, targetIndex, items);
 
-      items[targetIndex] = targetItem.copyWith(
-        initialOffset: draggedItem.initialOffset,
-        centerOffset: draggedItem.centerOffset,
-        animationController: createNewAnimationController(ticker),
-        isAnimated: false,
-        endOffset: Offset.zero,
-      );
+      _swapItems(draggedIndex, targetIndex, items);
 
-      // Swap items in the list
-      final temp = items[draggedIndex];
-      items[draggedIndex] = items[targetIndex];
-      items[targetIndex] = temp;
-
-      // Dispose the animation controller
-      targetItem.animationController?.reset();
-      targetItem.animationController?.dispose();
+      _disposeAnimationController(targetItem);
     });
 
-    if (!_isProcessingQueue) {
-      _processQueue();
-    }
+    processQueue();
   }
 
-  // Processes queued operations for drag-and-drop actions.
-  void _processQueue() async {
-    if (_isProcessingQueue) return;
-    _isProcessingQueue = true;
+  /// Swap only endOffset in [ItemRenderBoxModel] of [ElementModel] to be able to animate.
+  void _prepareItemsForAnimation(
+      int draggedIndex, int targetIndex, List<ElementModel> items) {
+    _updateItemsPositions(
+      firstIndex: targetIndex,
+      secondIndex: draggedIndex,
+      items: items,
+      isAnimated: true,
+    );
+    _updateItemsPositions(
+      firstIndex: draggedIndex,
+      secondIndex: targetIndex,
+      items: items,
+      isAnimated: false,
+    );
+  }
 
-    while (_functionQueue.isNotEmpty) {
-      final function = _functionQueue.removeFirst();
-      await function();
-    }
+  void _updateItemsPositions({
+    required int firstIndex,
+    required int secondIndex,
+    required List<ElementModel> items,
+    required bool isAnimated,
+  }) {
+    final itemToUpdate = items[firstIndex];
+    final itemToSwap = items[secondIndex];
+    ElementModel.updateElementModelFromList(
+      items,
+      firstIndex,
+      isAnimated: isAnimated,
+      renderBoxModel: itemToUpdate.renderBoxModel?.updateOffset(
+        recalculateCenter: true,
+        newOffset: itemToSwap.renderBoxModel?.initialOffset,
+      ),
+    );
+  }
 
-    _isProcessingQueue = false;
+  ///Completely updates [ItemRenderBoxModel] of [ElementModel] after animation.
+  void _updateInternalPropertiesAfterAnimation(
+      int draggedIndex, int targetIndex, List<ElementModel> items) {
+    final draggedItem = items[draggedIndex];
+    final targetItem = items[targetIndex];
+
+    ElementModel.updateElementModelFromList(
+      items,
+      draggedIndex,
+      renderBoxModel: draggedItem.renderBoxModel?.updateOffset(
+        recalculateCenter: true,
+        newOffset: targetItem.renderBoxModel?.initialOffset,
+        initialOffset: targetItem.renderBoxModel?.initialOffset,
+      ),
+    );
+
+    ElementModel.updateElementModelFromList(
+      items,
+      targetIndex,
+      renderBoxModel: targetItem.renderBoxModel?.updateOffset(
+        recalculateCenter: true,
+        newOffset: draggedItem.renderBoxModel?.initialOffset,
+        initialOffset: draggedItem.renderBoxModel?.initialOffset,
+      ),
+      isAnimated: false,
+      animationController:
+          AnimationManager.instance.createNewAnimationController(),
+    );
+  }
+
+  void _disposeAnimationController(ElementModel targetItem) {
+    targetItem.animationController?.reset();
+    targetItem.animationController?.dispose();
+  }
+
+  void _swapItems(int draggedIndex, int targetIndex, List<ElementModel> items) {
+    final temp = items[draggedIndex];
+    items[draggedIndex] = items[targetIndex];
+    items[targetIndex] = temp;
+  }
+
+  void clearQueueOutside() {
+    clearQueue();
+  }
+
+  void onSwapLeave() {
+    _initialTouchPosition = null;
+    _currentTargetIndex = null;
+    _touchSide = null;
   }
 }
